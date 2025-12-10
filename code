@@ -1,0 +1,265 @@
+!pip install -q pyspark==3.5.0
+  import os
+
+for d in ["core", "modules", "modules/threat_intel_fusion", "data"]:
+    os.makedirs(d, exist_ok=True)
+
+print(os.listdir("."))
+  %%writefile modules/__init__.py
+# empty init to treat "modules" as a package
+  %%writefile modules/threat_intel_fusion/__init__.py
+# Threat Intelligence / IOC fusion package
+%%writefile modules/threat_intel_fusion/ti_data.py
+# 간단한 샘플 IOC 데이터 정의
+
+HIGH_RISK_COUNTRIES = {"RU", "CN", "KP", "IR"}
+
+# 예시용 악성 IP 목록 (실제 서비스용이 아니라 데모용)
+MALICIOUS_IPS = {
+    "10.0.0.13",
+    "10.0.0.37",
+    "10.0.0.99",
+    "10.0.0.128",
+    "10.0.0.201",
+}
+%%writefile modules/threat_intel_fusion/ti_engine.py
+from .ti_data import HIGH_RISK_COUNTRIES, MALICIOUS_IPS
+
+def calc_ti_score(row) -> float:
+    """
+    단순 규칙 기반 Threat Intelligence 점수 계산.
+    row: pandas Series
+    """
+    score = 0.0
+
+    # 악성 IP 매칭
+    if row.get("src_ip") in MALICIOUS_IPS:
+        score += 50.0
+
+    # 고위험 국가
+    if row.get("country") in HIGH_RISK_COUNTRIES:
+        score += 20.0
+
+    # 로그인 실패 횟수
+    failed = row.get("failed_login_1h", 0)
+    if failed >= 3:
+        score += 10.0
+
+    # 고액 거래 + WEB 환경
+    amount = row.get("amount", 0.0)
+    device = row.get("device_type", "")
+    if amount >= 2_000_000 and device == "WEB":
+        score += 10.0
+
+    # 상한
+    if score > 100:
+        score = 100.0
+    return score
+%%writefile core/finance_log_generator.py
+import pandas as pd
+import random
+from datetime import datetime, timedelta
+import os
+
+def generate_finance_logs(n: int = 5000, seed: int = 42) -> pd.DataFrame:
+    random.seed(seed)
+
+    rows = []
+    base = datetime.now()
+
+    countries = ["KR", "US", "JP", "CN", "RU"]
+    devices = ["MOBILE", "WEB"]
+
+    for i in range(n):
+        ts = base - timedelta(minutes=i)
+        country = random.choice(countries)
+        device = random.choice(devices)
+
+        # 금액 분포를 약간 비틀어서 고액 거래가 조금 섞이게 함
+        if random.random() < 0.05:
+            amount = round(random.uniform(1_000_000, 5_000_000), 2)
+        else:
+            amount = round(random.uniform(1_000, 500_000), 2)
+
+        failed_login = random.randint(0, 7)
+
+        rows.append(
+            {
+                "tx_id": i + 1,
+                "timestamp": ts.isoformat(),
+                "user_id": random.randint(10_000, 99_999),
+                "amount": amount,
+                "country": country,
+                "src_ip": f"10.0.0.{random.randint(1, 254)}",
+                "dst_ip": f"192.168.0.{random.randint(1, 254)}",
+                "device_type": device,
+                "failed_login_1h": failed_login,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    os.makedirs("data", exist_ok=True)
+    df.to_csv("data/synthetic_finance_logs.csv", index=False)
+    return df
+  %%writefile core/spark_anomaly_detection.py
+from pyspark.sql import SparkSession, functions as F, types as T
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import VectorAssembler, StandardScaler
+from pyspark.ml.clustering import KMeans
+
+def create_spark(app_name: str = "FinancialSecurityPipeline") -> SparkSession:
+    spark = (
+        SparkSession.builder
+        .master("local[*]")
+        .appName(app_name)
+        .getOrCreate()
+    )
+    return spark
+
+
+def add_feature_columns(df_spark):
+    # 국가 위험도 간단 매핑
+    country_risk_map = {
+        "KR": 0.1,
+        "US": 0.2,
+        "JP": 0.3,
+        "CN": 0.7,
+        "RU": 0.8,
+    }
+
+    mapping_expr = F.create_map(
+        *[F.lit(x) for kv in country_risk_map.items() for x in kv]
+    )
+
+    df = df_spark.withColumn("country_risk", mapping_expr[F.col("country")])
+
+    # 야간 거래 여부 (0~6시)
+    df = df.withColumn(
+        "hour",
+        F.hour(F.to_timestamp("timestamp"))
+    ).withColumn(
+        "is_night",
+        F.when((F.col("hour") >= 0) & (F.col("hour") <= 6), F.lit(1.0)).otherwise(0.0)
+    )
+
+    return df
+
+
+def run_spark_anomaly_detection(pandas_df):
+    spark = create_spark()
+
+    # pandas -> Spark
+    df_spark = spark.createDataFrame(pandas_df)
+
+    df_spark = add_feature_columns(df_spark)
+
+    feature_cols = ["amount", "failed_login_1h", "country_risk", "is_night"]
+    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features_raw")
+    scaler = StandardScaler(inputCol="features_raw", outputCol="features_scaled")
+    kmeans = KMeans(featuresCol="features_scaled", predictionCol="cluster", k=4, seed=42)
+
+    pipeline = Pipeline(stages=[assembler, scaler, kmeans])
+    model = pipeline.fit(df_spark)
+    result = model.transform(df_spark)
+
+    # 클러스터별 건수 계산
+    cluster_sizes = (
+        result.groupBy("cluster")
+        .agg(F.count(F.lit(1)).alias("cnt"))
+        .collect()
+    )
+
+    size_map = {row["cluster"]: row["cnt"] for row in cluster_sizes}
+
+    # 작은 클러스터일수록 anomaly score 높게
+    @F.udf(T.DoubleType())
+    def anomaly_score_udf(cluster_id):
+        size = float(size_map.get(cluster_id, 1.0))
+        return 1.0 / size
+
+    result = result.withColumn("anomaly_score_raw", anomaly_score_udf(F.col("cluster")))
+
+    # 정규화 (0~1)
+    stats = result.agg(
+        F.min("anomaly_score_raw").alias("min_s"),
+        F.max("anomaly_score_raw").alias("max_s"),
+    ).collect()[0]
+
+    min_s = stats["min_s"]
+    max_s = stats["max_s"]
+    diff = max_s - min_s if max_s != min_s else 1.0
+
+    @F.udf(T.DoubleType())
+    def normalize_udf(v):
+        return (v - min_s) / diff
+
+    result = result.withColumn("anomaly_score", normalize_udf(F.col("anomaly_score_raw")))
+
+    # pandas로 다시 가져오기 (tx_id 기준으로 join에 사용)
+    result_pd = (
+        result.select("tx_id", "anomaly_score")
+        .toPandas()
+        .set_index("tx_id")
+    )
+
+    spark.stop()
+    return result_pd
+  %%writefile core/fraud_score_engine.py
+import pandas as pd
+from modules.threat_intel_fusion.ti_engine import calc_ti_score
+
+def apply_ti_scores(df: pd.DataFrame) -> pd.DataFrame:
+    ti_scores = df.apply(calc_ti_score, axis=1)
+    df = df.copy()
+    df["ti_score"] = ti_scores
+    return df
+
+
+def combine_scores(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # anomaly_score는 이미 0~1 범위라고 가정
+    anom = df["anomaly_score"].fillna(0.0)
+    ti = df["ti_score"].fillna(0.0)
+
+    # TI 점수 0~100 범위라고 보고 0~1로 스케일
+    ti_norm = ti / 100.0
+
+    # 최종 Fraud Score (0~100)
+    df["fraud_score"] = (0.6 * anom + 0.4 * ti_norm) * 100.0
+    return df
+%%writefile core/unified_pipeline.py
+import os
+import pandas as pd
+
+from core.finance_log_generator import generate_finance_logs
+from core.spark_anomaly_detection import run_spark_anomaly_detection
+from core.fraud_score_engine import apply_ti_scores, combine_scores
+
+
+def run_pipeline(n_logs: int = 5000) -> pd.DataFrame:
+    # 1) 금융 로그 생성
+    base_df = generate_finance_logs(n=n_logs)
+
+    # 2) Spark 기반 이상 탐지
+    anomaly_df = run_spark_anomaly_detection(base_df)
+    merged = base_df.join(anomaly_df, on="tx_id")
+
+    # 3) Threat Intel / IOC 기반 점수
+    merged = apply_ti_scores(merged)
+
+    # 4) 최종 Fraud Score
+    merged = combine_scores(merged)
+
+    # 결과 저장
+    os.makedirs("data", exist_ok=True)
+    out_path = "data/final_fraud_scored_logs.csv"
+    merged.to_csv(out_path, index=False)
+
+    return merged
+from core.unified_pipeline import run_pipeline
+
+df_result = run_pipeline(n_logs=3000)
+
+print("총 거래 수:", len(df_result))
+df_result.sort_values("fraud_score", ascending=False).head(10)
